@@ -1,5 +1,5 @@
 #! /usr/bin/env python3
-# Copyright(c) 2019, Intel Corporation
+# Copyright(c) 2019-2020, Intel Corporation
 #
 # Redistribution  and  use  in source  and  binary  forms,  with  or  without
 # modification, are permitted provided that the following conditions are met:
@@ -29,6 +29,7 @@
 
 from __future__ import absolute_import
 import argparse
+import ctypes
 import os
 import sys
 import struct
@@ -74,16 +75,12 @@ BLOCK0_SUBTYPE_ROOT_KEY_HASH_384 = 0x0300
 BLOCK0_CONTYPE_MASK = 0x00ff
 BLOCK0_CONSUBTYPE_MASK = 0xff00
 
-IOCTL_IFPGA_SECURE_UPDATE_START = 0xb900
-IOCTL_IFPGA_SECURE_UPDATE_WRITE_BLK = 0xb901
-IOCTL_IFPGA_SECURE_UPDATE_DATA_SENT = 0xb902
-IOCTL_IFPGA_SECURE_UPDATE_CHECK_COMPLETE = 0xb903
 IOCTL_IFPGA_SECURE_UPDATE_CANCEL = 0xb904
+IOCTL_IFPGA_SECURE_UPDATE = 0xb905
+IOCTL_IFPGA_SECURE_UPDATE_GET_STATUS = 0xb906
 
-FLASH_COPY_BPS = 43000.0   # bytes/sec when staging is flash
-DRAM_COPY_BPS = 92000.0  # bytes/sec staging area is dram
-DRAM_COPY_OFFSET = 42.0
-
+EFD_SEMAPHORE = 1
+LIBC = ctypes.cdll.LoadLibrary('libc.so.6')
 
 LOG = logging.getLogger()
 LOG_IOCTL = logging.DEBUG - 1
@@ -98,16 +95,6 @@ LOG_NAMES_TO_LEVELS = {
     'error': logging.ERROR,
     'critical': logging.CRITICAL
 }
-
-
-def linear_est_apply_tm(tcm, size):
-    # apply_bps is speed (bytes/sec) it takes to transfer from staging area
-    if tcm:
-        est = size/DRAM_COPY_BPS + DRAM_COPY_OFFSET
-    else:
-        est = size/FLASH_COPY_BPS
-    # Let's over-estimate by 1.5 to account for flash performance degradation
-    return 1.5*est
 
 
 def parse_args():
@@ -130,12 +117,6 @@ def parse_args():
 
     parser.add_argument('-y', '--yes', default=False, action='store_true',
                         help='answer Yes to all confirmation prompts')
-
-    parser.add_argument('-t', '--time', type=float, default=0.50,
-                        help=argparse.SUPPRESS)
-
-    parser.add_argument('-p', '--percentage', type=int, default=5,
-                        help=argparse.SUPPRESS)
 
     parser.add_argument('-v', '--version', action='version',
                         version='%(prog)s {}'.format(pretty_version()),
@@ -378,30 +359,30 @@ def canonicalize_bdf(bdf):
     return None
 
 
-def fw_write_block(fd_dev, offset, size, addr):
-    """Write firmware block to staging area.
-
-    fd_dev - an integer file descriptor to the os.open()'ed secure
-             device file.
-    offset - the offset into the staging area to write.
-    size - the size of the memory buffer in bytes.
-    addr - the user virtual address of the buffer.
-    """
-    buf = array.array('B', [0] * 32)
-    sizeof_ifpga_secure_write = 24
-
-    # offset size name
-    # 0x000     4 argsz
-    # 0x004     4 flags
-    # 0x008     4 offset
-    # 0x00c     4 size
-    # 0x010     8 buf
-
-    struct.pack_into('IIIIQ', buf, 0, sizeof_ifpga_secure_write, 0,
-                     offset, size, addr)
-
-    fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_WRITE_BLK,
-                buf, True)
+#def fw_write_block(fd_dev, offset, size, addr):
+#    """Write firmware block to staging area.
+#
+#    fd_dev - an integer file descriptor to the os.open()'ed secure
+#             device file.
+#    offset - the offset into the staging area to write.
+#    size - the size of the memory buffer in bytes.
+#    addr - the user virtual address of the buffer.
+#    """
+#    buf = array.array('B', [0] * 32)
+#    sizeof_ifpga_secure_write = 24
+#
+#    # offset size name
+#    # 0x000     4 argsz
+#    # 0x004     4 flags
+#    # 0x008     4 offset
+#    # 0x00c     4 size
+#    # 0x010     8 buf
+#
+#    struct.pack_into('IIIIQ', buf, 0, sizeof_ifpga_secure_write, 0,
+#                     offset, size, addr)
+#
+#    fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_WRITE_BLK,
+#                buf, True)
 
 
 class SecureUpdateError(Exception):
@@ -411,89 +392,56 @@ class SecureUpdateError(Exception):
         self.errno, self.strerror = arg
 
 
-class write_block_tuner(object):
-    """'Tunes' the transfer block size
+def eventfd(init_val, flags):
+    return LIBC.eventfd(init_val, flags)
 
-    Given a target execution time (self._target_time) for one iteration
-    of fw_write_block, measure the actual time and use that as an estimate
-    to adjust the block size. This is done so that the user receives
-    an update by the progress meter within a defined interval.
+
+def start_update(fd_dev, size, buf, efd):
+    """Starts the firmware update process.
+
+    fd_dev - an integer file descriptor to the os.open()'ed secure
+             device file.
+
+    size - size of the payload in bytes.
+
+    buf - the "raw" user space buffer address.
+
+    efd - the eventfd object for the kernel to signal status.
     """
 
-    MAX_TIMEDELTA = timedelta(days=999999999,
-                              hours=23,
-                              minutes=59,
-                              seconds=59,
-                              microseconds=999999)
+    # offset size name
+    # 0x000     4 size
+    # 0x004     8 buf
+    # 0x00c     8 eventfd
 
-    def __init__(self, fn, start_block_size, target_time, percent):
-        self._fn = fn
-        self._block_size = start_block_size
-        self._min_block_size = 64 * 1024
-        self._max_block_size = 4 * 1024 * 1024
-        self._new_block_size = self._block_size
-        self._total_transfer_size = 0
-        self._target_time = target_time
-        self._percent = percent
-        self._override = False
-        self._last_delta = timedelta(seconds=1)
-        self._total_time = timedelta(seconds=0)
+    iobuf = array.array('B', [0] * 32)
 
-    def within_percentage(self, delta):
-        """Is the given timedelta within self._percent of target?"""
-        delta_secs = delta.total_seconds()
-        target_secs = self._target_time.total_seconds()
-        low = target_secs - (target_secs * self._percent)
-        high = target_secs + (target_secs * self._percent)
-        return delta_secs >= low and delta_secs <= high
+    struct.pack_into('IQQ', iobuf, 0,
+                     size, buf, efd)
 
-    def __call__(self, fd_dev, offset, buf_addr):
-        begin = datetime.now()
-        self._fn(fd_dev, offset, self._block_size, buf_addr)
-        end = datetime.now()
+    fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE,
+                iobuf, False)
 
-        delta = end - begin
-        self._last_delta = delta
 
-        if self._override:
-            return
+def get_update_status(fd_dev):
+    """Query the status of the current firmware update.
 
-        if self.within_percentage(delta):
-            pass
-        elif delta < self._target_time:
-            increase_by = (self._target_time.total_seconds() /
-                           delta.total_seconds())
-            block_size = int(self._block_size * increase_by) & ~3
-            if block_size <= self._max_block_size:
-                self._new_block_size = block_size
-        elif delta > self._target_time:
-            decrease_by = (delta.total_seconds() /
-                           self._target_time.total_seconds())
-            block_size = int(self._block_size / decrease_by) & ~3
-            if block_size >= self._min_block_size:
-                self._new_block_size = block_size
+    fd_dev - an integer file descriptor to the os.open()'ed secure
+             device file.
 
-    @property
-    def to_transfer(self):
-        """Retrieve the current estimated block size."""
-        return self._block_size
+    returns a 3-tuple (size, progress, error)
+    """
+    # offset size name
+    # 0x000     4 size
+    # 0x004     4 progress
+    # 0x008     4 error
 
-    @to_transfer.setter
-    def to_transfer(self, size):
-        """Override the estimated block size with the given size."""
-        self._block_size = size
-        self._override = True
+    iobuf = array.array('B', [0xbe] * 32)
 
-    def accept(self):
-        """Accept the currently-calculated estimate as the new estimate."""
-        self._total_transfer_size += self._block_size
-        self._total_time += self._last_delta
-        self._block_size = self._new_block_size
-
-    @property
-    def total_seconds(self):
-        """Retrieve the total time in seconds for all measurements."""
-        return self._total_time.total_seconds()
+    fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_GET_STATUS,
+                iobuf, True)
+    
+    return struct.unpack_from('III', iobuf)
 
 
 def update_fw(fd_dev, args, pac):
@@ -506,10 +454,6 @@ def update_fw(fd_dev, args, pac):
 
     returns a 2-tuple of the process exit status and a message.
     """
-    init_block_size = 64 * 1024
-    offset = 0
-    max_retries = 120
-
     infile = args.file
 
     orig_pos = infile.tell()
@@ -520,9 +464,6 @@ def update_fw(fd_dev, args, pac):
     LOG.info('updating from file %s with size %d',
              infile.name, payload_size)
 
-    # staging area is either DRAM or FLASH device
-    apply_time = linear_est_apply_tm(pac.fme.have_node('tcm'), payload_size)
-
     progress_cfg = {}
     level = min([l.level for l in LOG.handlers])
     if level < logging.INFO:
@@ -530,94 +471,156 @@ def update_fw(fd_dev, args, pac):
     else:
         progress_cfg['stream'] = sys.stdout
 
-    retries = max_retries
-    while True:
-        if retries < max_retries:
-            LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_START (%d)', retries)
-        else:
-            LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_START')
-        try:
-            fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_START)
-            break
-        except IOError as exc:
-            if exc.errno != errno.EAGAIN or \
-               retries == 0:
-                return exc.errno, exc.strerror
-        retries -= 1
-        time.sleep(1.0)
+    efd = eventfd(0, EFD_SEMAPHORE)
 
-    LOG.info('writing to staging area')
+    fwbuf = array.array('B')
+    fwbuf.fromfile(infile, payload_size)
 
-    wbt = write_block_tuner(fw_write_block, init_block_size,
-                            timedelta(seconds=args.time),
-                            float(args.percentage) / 100.0)
+    fwbuf_addr, _ = fwbuf.buffer_info()
 
-    to_transfer = (init_block_size
-                   if init_block_size <= payload_size
-                   else payload_size)
-
-    with progress(bytes=payload_size, **progress_cfg) as prg:
-        while to_transfer:
-            buf = array.array('B')
-            buf.fromfile(infile, to_transfer)
-
-            buf_addr, buf_len = buf.buffer_info()
-
-            if buf_len != to_transfer:
-                to_transfer = buf_len
-
-            if to_transfer < wbt.to_transfer:
-                wbt.to_transfer = to_transfer
-
-            retries = max_retries
-            while True:
-                if retries < max_retries:
-                    LOG.log(LOG_IOCTL,
-                            'IOCTL ==> SECURE_UPDATE_WRITE_BLK (%d)', retries)
-                else:
-                    LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_WRITE_BLK')
-                try:
-                    wbt(fd_dev, offset, buf_addr)
-                    break
-                except IOError as exc:
-                    if exc.errno != errno.EAGAIN or \
-                       retries == 0:
-                        return exc.errno, exc.strerror
-                retries -= 1
-                time.sleep(1.0)
-
-            wbt.accept()
-
-            payload_size -= to_transfer
-            offset += to_transfer
-            to_transfer = (wbt.to_transfer
-                           if wbt.to_transfer <= payload_size
-                           else payload_size)
-
-            prg.update(offset)
-
-    LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_DATA_SENT')
     try:
-        fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_DATA_SENT)
+        start_update(fd_dev, payload_size, fwbuf_addr, efd)
     except IOError as exc:
         return exc.errno, exc.strerror
 
-    LOG.info('applying update to %s', pac.pci_node.pci_address)
-    with progress(time=apply_time, **progress_cfg) as prg:
+    with progress(bytes=payload_size, **progress_cfg) as prg:
         while True:
             try:
-                LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_CHECK_COMPLETE')
-                fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_CHECK_COMPLETE)
-                break
+                remaining, progress, error = get_update_status(fd_dev)
             except IOError as exc:
-                if exc.errno != errno.EAGAIN:
-                    return exc.errno, exc.strerror
-            prg.tick()
-            time.sleep(1.0)
+                return exc.errno, exc.strerror
+
+            prg.update(payload_size - remaining)
+
+            if not remaining:
+                break
 
     LOG.info('update of %s complete', pac.pci_node.pci_address)
 
     return 0, 'Secure update OK'
+
+#def update_fw(fd_dev, args, pac):
+#    """Writes firmware to secure device.
+#
+#    fd_dev - an integer file descriptor to the os.open()'ed secure
+#             device file.
+#
+#    args - the object resulting from command-line parsing.
+#
+#    returns a 2-tuple of the process exit status and a message.
+#    """
+#    init_block_size = 64 * 1024
+#    offset = 0
+#    max_retries = 120
+#
+#    infile = args.file
+#
+#    orig_pos = infile.tell()
+#    infile.seek(0, os.SEEK_END)
+#    payload_size = infile.tell() - orig_pos
+#    infile.seek(orig_pos, os.SEEK_SET)
+#
+#    LOG.info('updating from file %s with size %d',
+#             infile.name, payload_size)
+#
+#    # staging area is either DRAM or FLASH device
+#    apply_time = linear_est_apply_tm(pac.fme.have_node('tcm'), payload_size)
+#
+#    progress_cfg = {}
+#    level = min([l.level for l in LOG.handlers])
+#    if level < logging.INFO:
+#        progress_cfg['log'] = LOG.debug
+#    else:
+#        progress_cfg['stream'] = sys.stdout
+#
+#    retries = max_retries
+#    while True:
+#        if retries < max_retries:
+#            LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_START (%d)', retries)
+#        else:
+#            LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_START')
+#        try:
+#            fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_START)
+#            break
+#        except IOError as exc:
+#            if exc.errno != errno.EAGAIN or \
+#               retries == 0:
+#                return exc.errno, exc.strerror
+#        retries -= 1
+#        time.sleep(1.0)
+#
+#    LOG.info('writing to staging area')
+#
+#    wbt = write_block_tuner(fw_write_block, init_block_size,
+#                            timedelta(seconds=args.time),
+#                            float(args.percentage) / 100.0)
+#
+#    to_transfer = (init_block_size
+#                   if init_block_size <= payload_size
+#                   else payload_size)
+#
+#    with progress(bytes=payload_size, **progress_cfg) as prg:
+#        while to_transfer:
+#            buf = array.array('B')
+#            buf.fromfile(infile, to_transfer)
+#
+#            buf_addr, buf_len = buf.buffer_info()
+#
+#            if buf_len != to_transfer:
+#                to_transfer = buf_len
+#
+#            if to_transfer < wbt.to_transfer:
+#                wbt.to_transfer = to_transfer
+#
+#            retries = max_retries
+#            while True:
+#                if retries < max_retries:
+#                    LOG.log(LOG_IOCTL,
+#                            'IOCTL ==> SECURE_UPDATE_WRITE_BLK (%d)', retries)
+#                else:
+#                    LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_WRITE_BLK')
+#                try:
+#                    wbt(fd_dev, offset, buf_addr)
+#                    break
+#                except IOError as exc:
+#                    if exc.errno != errno.EAGAIN or \
+#                       retries == 0:
+#                        return exc.errno, exc.strerror
+#                retries -= 1
+#                time.sleep(1.0)
+#
+#            wbt.accept()
+#
+#            payload_size -= to_transfer
+#            offset += to_transfer
+#            to_transfer = (wbt.to_transfer
+#                           if wbt.to_transfer <= payload_size
+#                           else payload_size)
+#
+#            prg.update(offset)
+#
+#    LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_DATA_SENT')
+#    try:
+#        fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_DATA_SENT)
+#    except IOError as exc:
+#        return exc.errno, exc.strerror
+#
+#    LOG.info('applying update to %s', pac.pci_node.pci_address)
+#    with progress(time=apply_time, **progress_cfg) as prg:
+#        while True:
+#            try:
+#                LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_CHECK_COMPLETE')
+#                fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_CHECK_COMPLETE)
+#                break
+#            except IOError as exc:
+#                if exc.errno != errno.EAGAIN:
+#                    return exc.errno, exc.strerror
+#            prg.tick()
+#            time.sleep(1.0)
+#
+#    LOG.info('update of %s complete', pac.pci_node.pci_address)
+#
+#    return 0, 'Secure update OK'
 
 
 def sig_handler(signum, frame):
