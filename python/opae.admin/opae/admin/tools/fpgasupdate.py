@@ -43,6 +43,7 @@ import uuid
 import subprocess
 import time
 from datetime import datetime, timedelta
+import select
 import signal
 import errno
 import logging
@@ -78,6 +79,26 @@ BLOCK0_CONSUBTYPE_MASK = 0xff00
 IOCTL_IFPGA_SECURE_UPDATE_CANCEL = 0xb904
 IOCTL_IFPGA_SECURE_UPDATE = 0xb905
 IOCTL_IFPGA_SECURE_UPDATE_GET_STATUS = 0xb906
+
+UPDATE_PROGRESS_TO_STR = {
+    0: 'IDLE',
+    1: 'PREPARING',
+    2: 'WRITING',
+    3: 'PROGRAMMING',
+    4: '(max)'
+}
+
+UPDATE_ERROR_TO_STR = {
+    0: 'NONE',
+    1: 'OPERATION',
+    2: 'CRC',
+    3: 'AUTH',
+    4: 'TIMEOUT',
+    5: 'UABORT',
+    6: 'BUSY',
+    7: 'INVALID_SIZE',
+    8: '(max)'
+}
 
 EFD_SEMAPHORE = 1
 LIBC = ctypes.cdll.LoadLibrary('libc.so.6')
@@ -454,6 +475,9 @@ def update_fw(fd_dev, args, pac):
 
     returns a 2-tuple of the process exit status and a message.
     """
+    timeout = 15.0
+    max_retries = 4
+
     infile = args.file
 
     orig_pos = infile.tell()
@@ -481,19 +505,67 @@ def update_fw(fd_dev, args, pac):
     try:
         start_update(fd_dev, payload_size, fwbuf_addr, efd)
     except IOError as exc:
+        LIBC.close(efd)
         return exc.errno, exc.strerror
 
+    # Write phase.
+    retries = 0
     with progress(bytes=payload_size, **progress_cfg) as prg:
         while True:
             try:
-                remaining, progress, error = get_update_status(fd_dev)
+                remaining, prog, error = get_update_status(fd_dev)
             except IOError as exc:
+                LIBC.close(efd)
                 return exc.errno, exc.strerror
 
             prg.update(payload_size - remaining)
 
-            if not remaining:
+            if error:
+                LIBC.close(efd)
+                return error, UPDATE_ERROR_TO_STR[error]
+            elif not remaining:
                 break
+
+            read_set, _, _ = select.select([efd], [], [], timeout)
+
+            if efd not in read_set:
+                # timeout expired
+                retries += 1
+                if retries >= max_retries:
+                    LIBC.close(efd)
+                    return errno.ETIMEDOUT, 'Secure update timed out'
+            else:
+                retries = 0
+
+    # Programming phase.
+    retries = 0
+    while True:
+        try:
+            remaining, prog, error = get_update_status(fd_dev)
+        except IOError as exc:
+            LIBC.close(efd)
+            return exc.errno, exc.strerror
+
+        print('.', end='')
+
+        if error:
+            LIBC.close(efd)
+            return error, UPDATE_ERROR_TO_STR[error]
+        elif UPDATE_PROGRESS_TO_STR[prog] == 'IDLE':
+            break
+ 
+        read_set, _, _ = select.select([efd], [], [], timeout)
+
+        if efd not in read_set:
+            # timeout expired
+            retries += 1
+            if retries >= max_retries:
+                LIBC.close(efd)
+                return errno.ETIMEDOUT, 'Secure update timed out'
+        else:
+            retries = 0
+
+    LIBC.close(efd)
 
     LOG.info('update of %s complete', pac.pci_node.pci_address)
 
