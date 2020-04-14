@@ -450,7 +450,7 @@ def update_fw(fd_dev, args, pac):
     returns a 2-tuple of the process exit status and a message.
     """
     timeout = 15.0
-    max_retries = 4
+    max_retries = 20
 
     infile = args.file
 
@@ -470,6 +470,7 @@ def update_fw(fd_dev, args, pac):
         progress_cfg['stream'] = sys.stdout
 
     efd = eventfd(0, EFD_SEMAPHORE)
+    infd = os.fdopen(efd, 'rb')
 
     fwbuf = array.array('B')
     fwbuf.fromfile(infile, payload_size)
@@ -479,8 +480,11 @@ def update_fw(fd_dev, args, pac):
     try:
         start_update(fd_dev, payload_size, fwbuf_addr, efd)
     except IOError as exc:
+        infd.close()
         LIBC.close(efd)
         return exc.errno, exc.strerror
+
+    del fwbuf
 
     LOG.info('writing to staging area')
     LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE')
@@ -494,12 +498,14 @@ def update_fw(fd_dev, args, pac):
             try:
                 remaining, prog, error = get_update_status(fd_dev)
             except IOError as exc:
+                infd.close()
                 LIBC.close(efd)
                 return exc.errno, exc.strerror
 
             prg.update(payload_size - remaining)
 
             if error:
+                infd.close()
                 LIBC.close(efd)
                 return error, UPDATE_ERROR_TO_STR[error]
             elif not remaining:
@@ -511,9 +517,11 @@ def update_fw(fd_dev, args, pac):
                 # timeout expired
                 retries += 1
                 if retries >= max_retries:
+                    infd.close()
                     LIBC.close(efd)
                     return errno.ETIMEDOUT, 'Secure update timed out'
             else:
+                infd.read(8)
                 retries = 0
 
     LOG.info('applying update to %s', pac.pci_node.pci_address)
@@ -526,6 +534,7 @@ def update_fw(fd_dev, args, pac):
         try:
             remaining, prog, error = get_update_status(fd_dev)
         except IOError as exc:
+            infd.close()
             LIBC.close(efd)
             return exc.errno, exc.strerror
 
@@ -533,16 +542,31 @@ def update_fw(fd_dev, args, pac):
         sys.stdout.flush()
 
         if error:
+            infd.close()
             LIBC.close(efd)
             return error, UPDATE_ERROR_TO_STR[error]
         elif UPDATE_PROGRESS_TO_STR[prog] == 'IDLE':
             break
 
-        time.sleep(1.0)
+        #time.sleep(1.0)
 
-    print()
-    sys.stdout.flush()
+        read_set, _, _ = select.select([efd], [], [], timeout)
 
+        if efd not in read_set:
+            # timeout expired
+            retries += 1
+            if retries >= max_retries:
+                infd.close()
+                LIBC.close(efd)
+                return errno.ETIMEDOUT, 'Secure update timed out'
+        else:
+            infd.read(8)
+            retries = 0
+
+    #print()
+    #sys.stdout.flush()
+
+    infd.close()
     LIBC.close(efd)
 
     LOG.info('update of %s complete', pac.pci_node.pci_address)
