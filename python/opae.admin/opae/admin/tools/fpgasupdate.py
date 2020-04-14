@@ -439,6 +439,69 @@ def get_update_status(fd_dev):
     return struct.unpack_from('III', iobuf)
 
 
+def do_fw_update_phase(fd_dev, phase_msg, **kwargs):
+    """Performs one 'phase' of the firmware update.
+
+    fd_dev - an integer file descriptor to the os.open()'ed secure
+             device file.
+
+    phase_msg - a message to log just prior to the phase start.
+
+    kwargs -
+    'timeout' - timeout in seconds for one call to select.select().
+    'retries' - (starts at 0) count of the current number of retry
+                attempts for this phase.
+    'max_retries' - the maximum number of retries before this phase
+                    is marked as failing.
+    'efd' - the eventfd that the driver signals on completion of
+            the phase.
+    'infile' - the file object that can be used to read from the
+               eventfd corresponding to efd.
+    'payload_size' - size in bytes of the payload. Only applicable
+                     to the write phase.
+    'progress' - the progress meter object.
+
+    returns a 2-tuple of the process exit status and a message.
+    """
+    LOG.info(phase_msg)
+    while True:
+        LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_GET_STATUS')
+
+        try:
+            remaining, prog, error = get_update_status(fd_dev)
+        except IOError as exc:
+            return exc.errno, exc.strerror
+
+        if kwargs.get('payload_size'):
+            kwargs['progress'].update(kwargs['payload_size'] - remaining)
+        else:
+            kwargs['progress'].tick()
+
+        if error:
+            return error, UPDATE_ERROR_TO_STR[error]
+
+        read_set, _, _ = select.select([kwargs['efd']], [], [],
+                                       kwargs['timeout'])
+
+        if kwargs['efd'] not in read_set:
+            # timeout expired
+            kwargs['retries'] += 1
+            if kwargs['retries'] >= kwargs['max_retries']:
+                return errno.ETIMEDOUT, 'Secure update timed out'
+        else:
+            kwargs['infile'].read(8) # clear eventfd
+
+            LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_GET_STATUS')
+            remaining, prog, error = get_update_status(fd_dev)
+
+            if error:
+                return error, UPDATE_ERROR_TO_STR[error]
+            if remaining:
+                return 1, 'eventfd signaled with non-zero bytes remaining'
+
+            return 0, 'Success'
+
+
 def update_fw(fd_dev, args, pac):
     """Writes firmware to secure device.
 
@@ -449,8 +512,11 @@ def update_fw(fd_dev, args, pac):
 
     returns a 2-tuple of the process exit status and a message.
     """
-    timeout = 15.0
-    max_retries = 20
+    # bytes/sec when staging is flash
+    flash_copy_bps = 43000.0
+    # bytes/sec when staging area is dram
+    dram_copy_bps = 92000.0
+    dram_copy_offset = 42.0 
 
     infile = args.file
 
@@ -462,13 +528,6 @@ def update_fw(fd_dev, args, pac):
     LOG.info('updating from file %s with size %d',
              infile.name, payload_size)
 
-    progress_cfg = {}
-    level = min([l.level for l in LOG.handlers])
-    if level < logging.INFO:
-        progress_cfg['log'] = LOG.debug
-    else:
-        progress_cfg['stream'] = sys.stdout
-
     efd = eventfd(0, EFD_SEMAPHORE)
     infd = os.fdopen(efd, 'rb')
 
@@ -477,6 +536,7 @@ def update_fw(fd_dev, args, pac):
 
     fwbuf_addr, _ = fwbuf.buffer_info()
 
+    LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE')
     try:
         start_update(fd_dev, payload_size, fwbuf_addr, efd)
     except IOError as exc:
@@ -486,69 +546,23 @@ def update_fw(fd_dev, args, pac):
 
     del fwbuf
 
-    LOG.info('writing to staging area')
-    LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE')
-
-    # Write phase.
+    # Wait for an eventfd pulse to signal transition into
+    # the 'writing' phase.
     retries = 0
-    with progress(bytes=payload_size, **progress_cfg) as prg:
-        while True:
-            LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_GET_STATUS')
-
-            try:
-                remaining, prog, error = get_update_status(fd_dev)
-            except IOError as exc:
-                infd.close()
-                LIBC.close(efd)
-                return exc.errno, exc.strerror
-
-            prg.update(payload_size - remaining)
-
-            if error:
-                infd.close()
-                LIBC.close(efd)
-                return error, UPDATE_ERROR_TO_STR[error]
-            elif not remaining:
-                break
-
-            read_set, _, _ = select.select([efd], [], [], timeout)
-
-            if efd not in read_set:
-                # timeout expired
-                retries += 1
-                if retries >= max_retries:
-                    infd.close()
-                    LIBC.close(efd)
-                    return errno.ETIMEDOUT, 'Secure update timed out'
-            else:
-                infd.read(8)
-                retries = 0
-
-    LOG.info('applying update to %s', pac.pci_node.pci_address)
-
-    # Programming phase.
-    retries = 0
+    timeout = 1.0
+    max_retries = 60 * 5
     while True:
         LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_GET_STATUS')
 
         try:
             remaining, prog, error = get_update_status(fd_dev)
         except IOError as exc:
-            infd.close()
-            LIBC.close(efd)
             return exc.errno, exc.strerror
-
-        print('.', end='')
-        sys.stdout.flush()
 
         if error:
             infd.close()
             LIBC.close(efd)
             return error, UPDATE_ERROR_TO_STR[error]
-        elif UPDATE_PROGRESS_TO_STR[prog] == 'IDLE':
-            break
-
-        #time.sleep(1.0)
 
         read_set, _, _ = select.select([efd], [], [], timeout)
 
@@ -560,11 +574,55 @@ def update_fw(fd_dev, args, pac):
                 LIBC.close(efd)
                 return errno.ETIMEDOUT, 'Secure update timed out'
         else:
-            infd.read(8)
-            retries = 0
+            infd.read(8) # clear eventfd
+            break
 
-    #print()
-    #sys.stdout.flush()
+    progress_cfg = {}
+    level = min([l.level for l in LOG.handlers])
+    if level < logging.INFO:
+        progress_cfg['log'] = LOG.debug
+    else:
+        progress_cfg['stream'] = sys.stdout
+
+    status, msg = 0, 'Success'
+    # Write phase.
+    with progress(bytes=payload_size, **progress_cfg) as prg:
+        status, msg = do_fw_update_phase(fd_dev,
+                                         'writing to staging area',
+                                         timeout=1.0,
+                                         retries=0,
+                                         max_retries=60 * 60 * 2,
+                                         efd=efd,
+                                         infile=infd,
+                                         payload_size=payload_size,
+                                         progress=prg)
+    if status:
+        infd.close()
+        LIBC.close(efd)
+        return status, msg
+
+    if pac.fme.have_node('tcm'):
+        estimated_time = payload_size / dram_copy_bps + dram_copy_offset
+    else:
+        estimated_time = payload_size / flash_copy_bps
+    # over-estimate by 1.5 to account for flash performance degradation
+    estimated_time *= 1.5
+
+    # Programming phase.
+    msg = 'applying update to {}'.format(pac.pci_node.pci_address)
+    with progress(time=estimated_time, **progress_cfg) as prg:
+        status, msg = do_fw_update_phase(fd_dev,
+                                         msg,
+                                         timeout=1.0,
+                                         retries=0,
+                                         max_retries=60 * 60 * 3,
+                                         efd=efd,
+                                         infile=infd,
+                                         progress=prg)
+    if status:
+        infd.close()
+        LIBC.close(efd)
+        return status, msg
 
     infd.close()
     LIBC.close(efd)
