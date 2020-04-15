@@ -30,6 +30,7 @@
 from __future__ import absolute_import
 import argparse
 import ctypes
+from ctypes.util import find_library
 import os
 import sys
 import struct
@@ -101,7 +102,7 @@ UPDATE_ERROR_TO_STR = {
 }
 
 EFD_SEMAPHORE = 1
-LIBC = ctypes.cdll.LoadLibrary('libc.so.6')
+LIBC = ctypes.cdll.LoadLibrary(find_library('c'))
 
 LOG = logging.getLogger()
 LOG_IOCTL = logging.DEBUG - 1
@@ -435,7 +436,7 @@ def get_update_status(fd_dev):
 
     fcntl.ioctl(fd_dev, IOCTL_IFPGA_SECURE_UPDATE_GET_STATUS,
                 iobuf, True)
-    
+
     return struct.unpack_from('III', iobuf)
 
 
@@ -489,7 +490,7 @@ def do_fw_update_phase(fd_dev, phase_msg, **kwargs):
             if kwargs['retries'] >= kwargs['max_retries']:
                 return errno.ETIMEDOUT, 'Secure update timed out'
         else:
-            kwargs['infile'].read(8) # clear eventfd
+            kwargs['infile'].read(8)  # clear eventfd
 
             LOG.log(LOG_IOCTL, 'IOCTL ==> SECURE_UPDATE_GET_STATUS')
             remaining, prog, error = get_update_status(fd_dev)
@@ -516,7 +517,7 @@ def update_fw(fd_dev, args, pac):
     flash_copy_bps = 43000.0
     # bytes/sec when staging area is dram
     dram_copy_bps = 92000.0
-    dram_copy_offset = 42.0 
+    dram_copy_offset = 42.0
 
     infile = args.file
 
@@ -557,6 +558,8 @@ def update_fw(fd_dev, args, pac):
         try:
             remaining, prog, error = get_update_status(fd_dev)
         except IOError as exc:
+            infd.close()
+            LIBC.close(efd)
             return exc.errno, exc.strerror
 
         if error:
@@ -574,7 +577,7 @@ def update_fw(fd_dev, args, pac):
                 LIBC.close(efd)
                 return errno.ETIMEDOUT, 'Secure update timed out'
         else:
-            infd.read(8) # clear eventfd
+            infd.read(8)  # clear eventfd
             break
 
     progress_cfg = {}
