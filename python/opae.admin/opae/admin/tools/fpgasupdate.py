@@ -98,7 +98,8 @@ UPDATE_ERROR_TO_STR = {
     5: 'UABORT',
     6: 'BUSY',
     7: 'INVALID_SIZE',
-    8: '(max)'
+    8: 'FLASH_WEAROUT',
+    9: '(max)'
 }
 
 EFD_SEMAPHORE = 1
@@ -752,6 +753,10 @@ def main():
                     if io_err.errno != errno.EBUSY:
                         raise
             stat, mesg = 1, 'Interrupted'
+
+    if stat and mesg == 'FLASH_WEAROUT':
+        mesg = ('Secure update is delayed due to excessive flash counts.\n'
+                'Please wait 30 seconds and try again.')
 
     if stat:
         LOG.error(mesg)
