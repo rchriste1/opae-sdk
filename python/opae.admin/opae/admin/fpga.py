@@ -426,6 +426,9 @@ class fpga_base(sysfs_device):
             if not ifpga_sec:
                 ifpga_sec = spi.find_one(
                     'n3000bmc-secure.*.auto/ifpga_sec_mgr/ifpga_sec*')
+            if not ifpga_sec:
+                ifpga_sec = spi.find_one(
+                    'n5010bmc-secure.*.auto/ifpga_sec_mgr/ifpga_sec*')
             if ifpga_sec:
                 return secure_dev(ifpga_sec.sysfs_path, self.pci_node)
 
